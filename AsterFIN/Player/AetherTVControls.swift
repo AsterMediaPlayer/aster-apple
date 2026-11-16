@@ -44,7 +44,7 @@ struct AetherTVControls: View {
     }
 
     private enum Tab: Hashable {
-        case chapters, audio, subtitles, quality
+        case chapters, audio, subtitles, quality, together
 
         var title: String {
             switch self {
@@ -52,6 +52,7 @@ struct AetherTVControls: View {
             case .audio: "Audio"
             case .subtitles: "Subtitles"
             case .quality: "Quality"
+            case .together: "Watch Together"
             }
         }
     }
@@ -90,6 +91,8 @@ struct AetherTVControls: View {
     @State private var flickTop: CGFloat?
     @State private var panelTop: CGFloat?
     @FocusState private var focus: Focus?
+    /// The server's Watch Together groups, for the tab.
+    @State private var togetherGroups: [SyncPlayGroupInfo] = []
 
     private var tabs: [Tab] {
         var tabs: [Tab] = []
@@ -97,6 +100,7 @@ struct AetherTVControls: View {
         if !playback.audioChoices.isEmpty { tabs.append(.audio) }
         if !playback.subtitleChoices.isEmpty { tabs.append(.subtitles) }
         tabs.append(.quality)
+        if playback.canWatchTogether { tabs.append(.together) }
         return tabs
     }
 
@@ -242,7 +246,7 @@ struct AetherTVControls: View {
         if let target = scrubTarget {
             play(from: target)
         } else {
-            engine.togglePlayPause()
+            playback.userTogglePlayPause()
             show()
         }
     }
@@ -295,13 +299,19 @@ struct AetherTVControls: View {
         if let target = scrubTarget {
             scrubTarget = clamped(target + seconds)
         } else {
-            AetherPlayerView.skip(seconds, on: engine)
+            playback.userSkip(seconds)
         }
         show()
     }
 
     private func play(from target: Double) {
         show()
+        // Watching together, the group seeks and plays on together.
+        if SyncPlay.shared.controls(playback) {
+            playback.userSeekThenPlay(to: target)
+            scrubTarget = nil
+            return
+        }
         Task {
             await engine.seek(to: target)
             engine.play()
@@ -590,6 +600,8 @@ struct AetherTVControls: View {
                 optionRow(.quality, options: playback.qualityChoices.map { ($0.id, $0.title) }, selected: playback.currentQuality) { cap in
                     playback.chooseQuality(cap)
                 }
+            case .together:
+                togetherRow
             }
         }
         .frame(maxWidth: .infinity, minHeight: Self.cardContentHeight, maxHeight: Self.cardContentHeight, alignment: .topLeading)
@@ -650,10 +662,7 @@ struct AetherTVControls: View {
 
     private func play(_ chapter: ChapterInfo) {
         closePanel()
-        Task {
-            await engine.seek(to: Double(chapter.startPositionTicks) / 10_000_000)
-            engine.play()
-        }
+        playback.play(chapter: chapter)
     }
 
     // MARK: Tracks
@@ -694,6 +703,57 @@ struct AetherTVControls: View {
         case .audio: playback.currentAudio.map { .option(.audio, $0) } ?? playback.audioChoices.first.map { .option(.audio, $0.id) }
         case .subtitles: .option(.subtitles, playback.currentSubtitle)
         case .quality: .option(.quality, playback.currentQuality)
+        case .together: .option(.together, 0)
+        }
+    }
+
+    // MARK: Watch Together
+
+    /// Start a group, join one of the server's, or leave the one this is in.
+    private var togetherRow: some View {
+        let syncPlay = SyncPlay.shared
+        return VStack(alignment: .leading, spacing: 4) {
+            Text(togetherCaption)
+                .font(.callout)
+                .foregroundStyle(syncPlay.problem == nil ? Color.secondary : Color.red)
+                .lineLimit(2)
+                .padding(.horizontal, 8)
+            optionRow(.together, options: togetherOptions, selected: nil) { id in chooseTogether(id) }
+        }
+        .task(id: syncPlay.isInGroup) {
+            guard !syncPlay.isInGroup else { return }
+            togetherGroups = await syncPlay.groups()
+        }
+    }
+
+    private var togetherCaption: String {
+        let syncPlay = SyncPlay.shared
+        if let problem = syncPlay.problem { return problem }
+        if let group = syncPlay.group {
+            let name = group.groupName.isEmpty ? "Your group" : group.groupName
+            return [name, syncPlay.watchingLine, syncPlay.stateLine].compactMap { $0 }.joined(separator: " · ")
+        }
+        return "Start a group others can join from their Jellyfin apps, or join one, and watch in step."
+    }
+
+    private var togetherOptions: [(id: Int, title: String)] {
+        if SyncPlay.shared.isInGroup { return [(0, "Leave Group")] }
+        return [(0, "Start a Group")] + togetherGroups.enumerated().map { index, group in
+            (index + 1, "Join \(group.groupName.isEmpty ? "a group" : group.groupName) (\(group.participants.count))")
+        }
+    }
+
+    private func chooseTogether(_ id: Int) {
+        let syncPlay = SyncPlay.shared
+        Task {
+            if syncPlay.isInGroup {
+                await syncPlay.leave()
+                togetherGroups = await syncPlay.groups()
+            } else if id == 0 {
+                await syncPlay.startGroup(named: SyncPlay.newGroupName, with: playback)
+            } else if togetherGroups.indices.contains(id - 1) {
+                await syncPlay.join(togetherGroups[id - 1], with: playback)
+            }
         }
     }
 }

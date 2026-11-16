@@ -237,6 +237,7 @@ final class AetherPlayback {
         self.entry = entry
         self.preferences = preferences
         self.nowPlaying = AetherNowPlaying(engine: engine, client: client)
+        nowPlaying.playback = self
     }
 
     func start() async {
@@ -309,14 +310,19 @@ final class AetherPlayback {
     /// Playing from here on, once the engine has the stream.
     private func begin(_ item: BaseItem) async {
         if speed != 1 { engine.setRate(speed) }
-        engine.play()
+        // A title a Watch Together group asked for waits, paused, until
+        // everyone has it; the group then plays it for all at once.
+        let heldForGroup = canWatchTogether && SyncPlay.shared.holdsStart(of: item.id)
+        if heldForGroup { engine.pause() } else { engine.play() }
         hasStarted = true
         stopReported = false
         nowPlaying.seekable = !followsTimeline
         nowPlaying.show(item)
         trickplay = isLive ? nil : ScrubPreviewSource(client: client, item: item, mediaSourceId: mediaSourceId)
+        if canWatchTogether { SyncPlay.shared.attach(self) }
+        if heldForGroup { SyncPlay.shared.playerLoaded(self) }
         if reportsPlayback {
-            await client.reportStart(report(paused: false))
+            await client.reportStart(report(paused: heldForGroup))
             startReporting()
         }
         onItemStarted?(item)
@@ -1071,6 +1077,8 @@ final class AetherPlayback {
     func stop() {
         guard !stopped else { return }
         stopped = true
+        // Closing the player leaves a Watch Together group.
+        SyncPlay.shared.detach(self)
         #if os(iOS)
         pip?.stop()
         pip = nil
@@ -1132,7 +1140,9 @@ final class AetherPlayback {
         }
         guard upNext != nil else { return false }
         endCardVisible = true
-        if AppSettings.autoplayNext { startCountdown() }
+        // Watching together, the group moves on when someone picks Play
+        // Next, rather than each player counting down on its own.
+        if AppSettings.autoplayNext, !SyncPlay.shared.controls(self) { startCountdown() }
         return true
     }
 
@@ -1141,6 +1151,13 @@ final class AetherPlayback {
         countdownTask?.cancel()
         countdown = nil
         guard let next = upNext else { return }
+        // Watching together: the next episode for the whole group, which
+        // every player then loads and plays once all are ready.
+        if SyncPlay.shared.controls(self) {
+            endCardVisible = false
+            SyncPlay.shared.requestNewQueue(itemId: next.id, startTicks: 0)
+            return
+        }
         // From Play Next Episode, before the end: this one stops here.
         if hasStarted, !stopReported {
             stopReported = true
@@ -1210,8 +1227,7 @@ final class AetherPlayback {
     func skipActiveSegment() {
         guard let segment = activeSegment else { return }
         activeSegment = nil
-        let engine = engine
-        Task { await engine.seek(to: Double(segment.endTicks) / 10_000_000) }
+        userSeek(to: Double(segment.endTicks) / 10_000_000)
     }
 
     /// Four times a second: which marker the playhead is in (skipping an
@@ -1393,11 +1409,7 @@ final class AetherPlayback {
     }
 
     func play(chapter: ChapterInfo) {
-        let engine = engine
-        Task {
-            await engine.seek(to: Double(chapter.startPositionTicks) / 10_000_000)
-            engine.play()
-        }
+        userSeekThenPlay(to: Double(chapter.startPositionTicks) / 10_000_000)
     }
 
     /// The picture for a point on the timeline while scrubbing: a trickplay
@@ -1670,4 +1682,91 @@ final class AetherPlayback {
         )
     }
 }
+// MARK: - Watch Together
+
+extension AetherPlayback: SyncPlayPlayer {
+    /// Whether what's playing can be watched together: a title on Jellyfin,
+    /// not a channel, which keeps to its own schedule.
+    var canWatchTogether: Bool { SyncPlay.isAvailable(on: client) && !followsTimeline }
+
+    var syncItemId: String? { item?.id }
+    var syncPositionTicks: Int64 { Ticks.ticks(precisePosition) }
+    var syncIsPlaying: Bool { engine.state == .playing }
+
+    var syncIsBuffering: Bool {
+        switch engine.playbackPhase {
+        case .rebuffering, .stalled, .loading: true
+        default: false
+        }
+    }
+
+    func syncPlay() {
+        engine.play()
+    }
+
+    func syncPause() {
+        engine.pause()
+    }
+
+    func syncSeek(to ticks: Int64) async {
+        await engine.seek(to: Ticks.seconds(max(0, ticks)))
+    }
+
+    func syncLoad(itemId: String, startTicks: Int64) {
+        guard !stopped else { return }
+        let client = client
+        Task { [weak self] in
+            guard let found = try? await client.item(itemId), let self, !self.stopped else { return }
+            self.endServerSession()
+            self.play(found, entry: PlaybackQueueItem(itemId: found.id, startTicks: startTicks))
+        }
+    }
+
+    // MARK: What the person does
+
+    /// Play and pause from the controls, the remote, the keyboard and the
+    /// Lock Screen: through the group when watching together, else here.
+    func userTogglePlayPause() {
+        if SyncPlay.shared.controls(self) { SyncPlay.shared.requestToggle() } else { engine.togglePlayPause() }
+    }
+
+    func userPlay() {
+        if SyncPlay.shared.controls(self) { SyncPlay.shared.requestUnpause() } else { engine.play() }
+    }
+
+    func userPause() {
+        if SyncPlay.shared.controls(self) { SyncPlay.shared.requestPause() } else { engine.pause() }
+    }
+
+    /// A jump by `seconds`, from where the last one was headed, so presses in
+    /// a row add up.
+    func userSkip(_ seconds: Double) {
+        let from = engine.seekTarget ?? engine.clock.currentTime
+        userSeek(to: min(max(from + seconds, 0), max(engine.duration - 1, 0)))
+    }
+
+    /// A jump or a scrub to `seconds`: the group seeks together.
+    func userSeek(to seconds: Double) {
+        if SyncPlay.shared.controls(self) {
+            SyncPlay.shared.requestSeek(to: Ticks.ticks(seconds))
+        } else {
+            let engine = engine
+            Task { await engine.seek(to: seconds) }
+        }
+    }
+
+    /// A scrub or a chapter picked while paused, then playing on from there.
+    func userSeekThenPlay(to seconds: Double) {
+        if SyncPlay.shared.controls(self) {
+            SyncPlay.shared.requestSeek(to: Ticks.ticks(seconds), thenPlay: true)
+        } else {
+            let engine = engine
+            Task {
+                await engine.seek(to: seconds)
+                engine.play()
+            }
+        }
+    }
+}
+
 #endif
