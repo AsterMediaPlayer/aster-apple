@@ -28,6 +28,9 @@ import AppKit
 #endif
 
 final class AetherNowPlaying {
+    /// The player it speaks for: in a Watch Together group, play, pause and
+    /// seek from the Lock Screen go through it to the group.
+    weak var playback: AetherPlayback?
     static let skipSeconds: Double = 10
 
     /// Whether the lock screen, Control Center and headphones may skip and
@@ -200,34 +203,35 @@ final class AetherNowPlaying {
             _ = token
             #endif
         }
+        let player = { [weak self] in self?.playback }
         on(center.playCommand) { _ in
-            Task { @MainActor in engine.play() }
+            Task { @MainActor in if let playback = player() { playback.userPlay() } else { engine.play() } }
             return .success
         }
         on(center.pauseCommand) { _ in
-            Task { @MainActor in engine.pause() }
+            Task { @MainActor in if let playback = player() { playback.userPause() } else { engine.pause() } }
             return .success
         }
         on(center.togglePlayPauseCommand) { _ in
-            Task { @MainActor in engine.togglePlayPause() }
+            Task { @MainActor in if let playback = player() { playback.userTogglePlayPause() } else { engine.togglePlayPause() } }
             return .success
         }
         center.skipForwardCommand.preferredIntervals = [NSNumber(value: Self.skipSeconds)]
         center.skipBackwardCommand.preferredIntervals = [NSNumber(value: Self.skipSeconds)]
         on(center.skipForwardCommand) { _ in
             guard seekable() else { return .commandFailed }
-            Task { @MainActor in await Self.skip(engine, by: Self.skipSeconds) }
+            Task { @MainActor in if let playback = player() { playback.userSkip(Self.skipSeconds) } else { await Self.skip(engine, by: Self.skipSeconds) } }
             return .success
         }
         on(center.skipBackwardCommand) { _ in
             guard seekable() else { return .commandFailed }
-            Task { @MainActor in await Self.skip(engine, by: -Self.skipSeconds) }
+            Task { @MainActor in if let playback = player() { playback.userSkip(-Self.skipSeconds) } else { await Self.skip(engine, by: -Self.skipSeconds) } }
             return .success
         }
         on(center.changePlaybackPositionCommand) { event in
             guard seekable(), let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
             let seconds = event.positionTime
-            Task { @MainActor in await engine.seek(to: seconds) }
+            Task { @MainActor in if let playback = player() { playback.userSeek(to: seconds) } else { await engine.seek(to: seconds) } }
             return .success
         }
         // Videos have no tracks to step through.

@@ -185,8 +185,23 @@ final class SyncPlay {
         send("/SyncPlay/Unpause")
     }
 
-    func requestSeek(to ticks: Int64) {
-        send("/SyncPlay/Seek", body: SyncPlaySeek(positionTicks: max(0, ticks)))
+    /// The group seeks together; `thenPlay` plays on from there once all are
+    /// ready (a scrub, or a chapter picked).
+    func requestSeek(to ticks: Int64, thenPlay: Bool = false) {
+        guard let client else { return }
+        Task {
+            do {
+                try await client.post("/SyncPlay/Seek", body: SyncPlaySeek(positionTicks: max(0, ticks)))
+                if thenPlay { try await client.post("/SyncPlay/Unpause") }
+            } catch {
+                problem = Self.describe(error)
+            }
+        }
+    }
+
+    /// Another title for the whole group (Play Next): every player loads it.
+    func requestNewQueue(itemId: String, startTicks: Int64) {
+        send("/SyncPlay/SetNewQueue", body: SyncPlaySetQueue(playingQueue: [itemId], playingItemPosition: 0, startPositionTicks: startTicks))
     }
 
     // MARK: Plumbing

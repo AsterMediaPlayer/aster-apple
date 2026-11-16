@@ -26,6 +26,8 @@ struct AetherPlayerView: View {
     @State private var fills = false
     /// A double-tap skip just made: which way, shown briefly over its side.
     @State private var skipFlash: SkipFlash?
+    /// The Watch Together sheet is up.
+    @State private var showsWatchTogether = false
     #endif
     #if !os(tvOS)
     @Environment(AppSession.self) private var session
@@ -165,6 +167,13 @@ struct AetherPlayerView: View {
                 .transition(.opacity)
             }
 
+            // Watching together: waiting for everyone, who joined, problems.
+            WatchTogetherBadge()
+                .padding(48)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .animation(.easeInOut(duration: 0.25), value: SyncPlay.shared.notice)
+                .animation(.easeInOut(duration: 0.25), value: SyncPlay.shared.state)
+
             if playback.qualityOfferVisible, !playback.endCardVisible {
                 StallQualityCard(playback: playback)
                     .transition(.opacity)
@@ -297,7 +306,7 @@ struct AetherPlayerView: View {
                                 // A channel keeps to its timeline: nothing to skip through.
                                 guard !playback.followsTimeline else { return }
                                 let forward = value.location.x > proxy.size.width / 2
-                                Self.skip(forward ? 10 : -10, on: engine)
+                                playback.userSkip(forward ? 10 : -10)
                                 skipFlash = SkipFlash(forward: forward)
                             }
                             .exclusively(before: TapGesture().onEnded { toggleControls() })
@@ -343,6 +352,9 @@ struct AetherPlayerView: View {
                 }
             }
             #endif
+        }
+        .sheet(isPresented: $showsWatchTogether) {
+            WatchTogetherSheet(player: playback)
         }
         .task(id: controlsShownAt) {
             // The controls fade a few seconds after the last touch.
@@ -488,7 +500,7 @@ struct AetherPlayerView: View {
             if playback.isLive {
                 LiveBadge()
             } else {
-                AetherTimeline(engine: engine, clock: engine.clock, onScrub: reveal, preview: playback.scrubPreview(at:))
+                AetherTimeline(engine: engine, clock: engine.clock, onScrub: reveal, seek: { playback.userSeek(to: $0) }, preview: playback.scrubPreview(at:))
                     // On a channel it shows how far in, but can't be dragged.
                     .allowsHitTesting(!playback.followsTimeline)
             }
@@ -507,6 +519,14 @@ struct AetherPlayerView: View {
                     speedMenu
                 }
                 trackMenus
+                if playback.canWatchTogether {
+                    Button {
+                        showsWatchTogether = true
+                    } label: {
+                        Label("Watch Together", systemImage: SyncPlay.shared.isInGroup ? "person.2.fill" : "person.2")
+                    }
+                    .help("Watch Together")
+                }
             }
             #if os(iOS)
             // Icons only: an upright iPhone has no room for the words.
@@ -732,12 +752,12 @@ struct AetherPlayerView: View {
     }
 
     private func togglePlayPause() {
-        engine.togglePlayPause()
+        playback.userTogglePlayPause()
         reveal()
     }
 
     private func skip(_ seconds: Double) {
-        Self.skip(seconds, on: engine)
+        playback.userSkip(seconds)
         reveal()
     }
     #endif
@@ -753,6 +773,8 @@ struct AetherTimeline: View {
     /// Apple TV: where a swipe has moved the playhead to, not yet played from.
     var scrubTarget: Double? = nil
     var onScrub: () -> Void = {}
+    /// Where a drag on the bar is let go; the engine's own seek when nil.
+    var seek: ((Double) -> Void)? = nil
     /// The picture for a point on the timeline, shown above the playhead
     /// while scrubbing.
     var preview: ((Double) async -> CGImage?)? = nil
@@ -800,6 +822,11 @@ struct AetherTimeline: View {
                         }
                         .onEnded { _ in
                             guard let target = scrubPosition else { return }
+                            if let seek {
+                                seek(target)
+                                scrubPosition = nil
+                                return
+                            }
                             Task {
                                 await engine.seek(to: target)
                                 scrubPosition = nil
